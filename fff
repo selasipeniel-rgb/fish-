@@ -1,0 +1,1056 @@
+import { useState, useEffect, useCallback } from "react";
+
+// ─── Utility helpers ───────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2, 9);
+const today = () => new Date().toISOString().slice(0, 10);
+const fmt = (d) => new Date(d).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+const daysBetween = (a, b) => Math.ceil((new Date(b) - new Date(a)) / 86400000);
+
+const STAGE_ORDER = ["Fingerling", "Juvenile", "Grow-out", "Harvest-ready"];
+const STAGE_DAYS = { Fingerling: 30, Juvenile: 60, "Grow-out": 90, "Harvest-ready": 0 };
+
+const STAGE_TASKS = {
+  Fingerling: ["Check water temp every morning", "Feed 4x daily (2% BW)", "Monitor dissolved oxygen", "Check for fin/skin abnormalities", "Record mortality count"],
+  Juvenile: ["Feed 3x daily (3% BW)", "Check pH & ammonia levels", "Partial water change (20%)", "Weigh sample batch", "Inspect for disease signs"],
+  "Grow-out": ["Feed 2x daily (5% BW)", "Daily water quality check", "Weekly biomass sampling", "Check pond aerator", "Record FCR"],
+  "Harvest-ready": ["Cease feeding 24h before harvest", "Prepare harvest equipment", "Arrange transport/buyer", "Final water quality check", "Document final weight"],
+};
+
+const WATER_PARAMS = [
+  { key: "ph", label: "pH", unit: "", min: 6.5, max: 8.5, warn: [6.0, 9.0] },
+  { key: "temp", label: "Temperature", unit: "°C", min: 25, max: 32, warn: [20, 35] },
+  { key: "do", label: "Dissolved O₂", unit: "mg/L", min: 5, max: 10, warn: [3, 12] },
+  { key: "ammonia", label: "Ammonia", unit: "mg/L", min: 0, max: 0.5, warn: [0, 2] },
+  { key: "turbidity", label: "Turbidity", unit: "NTU", min: 20, max: 40, warn: [10, 60] },
+];
+
+const DISEASES = [
+  { name: "Ich (White Spot)", symptoms: "White spots on fins/body, scratching", remedy: "Raise temp to 30°C, add 1g/L salt, treat with malachite green", dosage: "0.1mg/L malachite green" },
+  { name: "Bacterial Fin Rot", symptoms: "Frayed/discoloured fins, lethargy", remedy: "Remove infected fish, antibacterial bath, improve water quality", dosage: "10mg/L oxytetracycline" },
+  { name: "Dropsy", symptoms: "Bloated body, raised scales", remedy: "Isolate fish, epsom salt bath, antibiotic treatment", dosage: "1 tsp/gallon epsom salt" },
+  { name: "Columnaris", symptoms: "White/grey patches, ulcers, tail fraying", remedy: "Antibiotic treatment, lower temp, improve O₂", dosage: "20mg/L kanamycin" },
+  { name: "Anchor Worm", symptoms: "Visible worm threads, redness, scratching", remedy: "Remove worms with tweezers, potassium permanganate dip", dosage: "10mg/L KMnO₄ for 30min" },
+];
+
+const SEED = {
+  ponds: [
+    { id: "p1", name: "Pond Alpha", species: "Tilapia", capacity: 500, stocked: 420, status: "Active", stage: "Grow-out", stagedAt: "2025-02-10", weight: 280, created: "2025-01-15" },
+    { id: "p2", name: "Pond Beta", species: "Catfish", capacity: 300, stocked: 260, status: "Active", stage: "Juvenile", stagedAt: "2025-03-01", weight: 85, created: "2025-02-20" },
+    { id: "p3", name: "Pond Gamma", species: "Tilapia", capacity: 400, stocked: 0, status: "Fallow", stage: "Fingerling", stagedAt: today(), weight: 0, created: "2025-01-10" },
+  ],
+  waterLogs: [
+    { id: uid(), pondId: "p1", date: today(), ph: 7.2, temp: 28, do: 6.5, ammonia: 0.2, turbidity: 30 },
+    { id: uid(), pondId: "p2", date: today(), ph: 7.8, temp: 29, do: 5.2, ammonia: 0.8, turbidity: 45 },
+  ],
+  activities: [
+    { id: uid(), pondId: "p1", type: "Feeding", date: today(), qty: "2.5 kg", note: "Morning feed", status: "Done" },
+    { id: uid(), pondId: "p2", type: "Water Change", date: today(), qty: "20%", note: "Routine change", status: "Done" },
+    { id: uid(), pondId: "p1", type: "Medication", date: "2025-05-20", qty: "50ml", note: "Preventive treatment", status: "Done" },
+  ],
+  feedStock: [{ id: uid(), item: "Starter Feed (2mm)", qty: 50, unit: "kg" }, { id: uid(), item: "Grower Feed (4mm)", qty: 120, unit: "kg" }],
+  feedLogs: [],
+  growthLogs: [
+    { id: uid(), pondId: "p1", date: "2025-02-10", weight: 50 },
+    { id: uid(), pondId: "p1", date: "2025-03-10", weight: 120 },
+    { id: uid(), pondId: "p1", date: "2025-04-10", weight: 200 },
+    { id: uid(), pondId: "p1", date: today(), weight: 280 },
+  ],
+  healthLogs: [],
+  financials: [
+    { id: uid(), pondId: "p1", type: "Expense", category: "Feed", amount: 12000, date: "2025-02-15", note: "Bulk feed purchase" },
+    { id: uid(), pondId: "p1", type: "Revenue", category: "Sale", amount: 0, date: today(), note: "Projected harvest" },
+  ],
+  tasks: [],
+};
+
+// ─── Storage ───────────────────────────────────────────────────────────────────
+const load = (key, def) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; } catch { return def; } };
+const save = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
+
+// ─── Micro-components ──────────────────────────────────────────────────────────
+const Badge = ({ color, children }) => {
+  const map = { green: "#1a7a4a", yellow: "#a67c00", red: "#a0001e", blue: "#0047ab", gray: "#555" };
+  return <span style={{ background: map[color] || map.gray, color: "#fff", padding: "2px 10px", borderRadius: 20, fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase" }}>{children}</span>;
+};
+
+const Card = ({ children, style = {} }) => (
+  <div style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.09)", borderRadius: 14, padding: "20px 22px", ...style }}>{children}</div>
+);
+
+const StatCard = ({ icon, label, value, sub, color = "#4fc97e" }) => (
+  <Card style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 160 }}>
+    <span style={{ fontSize: 26 }}>{icon}</span>
+    <div style={{ fontSize: 28, fontWeight: 800, color, fontFamily: "'Syne', sans-serif", lineHeight: 1 }}>{value}</div>
+    <div style={{ fontSize: 13, color: "#aaa", fontWeight: 600 }}>{label}</div>
+    {sub && <div style={{ fontSize: 11, color: "#666" }}>{sub}</div>}
+  </Card>
+);
+
+const Btn = ({ onClick, children, variant = "primary", style = {} }) => {
+  const base = { padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", fontWeight: 700, fontSize: 13, transition: "all .15s", fontFamily: "'Syne', sans-serif", letterSpacing: 0.3 };
+  const variants = {
+    primary: { background: "#4fc97e", color: "#0a1a12" },
+    danger: { background: "#a0001e", color: "#fff" },
+    ghost: { background: "rgba(255,255,255,0.07)", color: "#ccc", border: "1px solid rgba(255,255,255,0.12)" },
+    blue: { background: "#0047ab", color: "#fff" },
+  };
+  return <button onClick={onClick} style={{ ...base, ...variants[variant], ...style }}>{children}</button>;
+};
+
+const Input = ({ label, value, onChange, type = "text", placeholder = "", min, max, step }) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+    {label && <label style={{ fontSize: 12, color: "#888", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</label>}
+    <input
+      type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+      min={min} max={max} step={step}
+      style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 8, padding: "9px 12px", color: "#eee", fontSize: 14, outline: "none", width: "100%", boxSizing: "border-box" }}
+    />
+  </div>
+);
+
+const Select = ({ label, value, onChange, options }) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+    {label && <label style={{ fontSize: 12, color: "#888", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>{label}</label>}
+    <select value={value} onChange={e => onChange(e.target.value)}
+      style={{ background: "#0e1f15", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 8, padding: "9px 12px", color: "#eee", fontSize: 14, outline: "none", width: "100%" }}>
+      {options.map(o => <option key={o.value ?? o} value={o.value ?? o}>{o.label ?? o}</option>)}
+    </select>
+  </div>
+);
+
+const Modal = ({ title, onClose, children }) => (
+  <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={onClose}>
+    <div style={{ background: "#0e1f15", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 16, padding: 28, minWidth: 360, maxWidth: 560, width: "90%", maxHeight: "85vh", overflowY: "auto" }} onClick={e => e.stopPropagation()}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <h3 style={{ margin: 0, fontSize: 18, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>{title}</h3>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#666", fontSize: 22, cursor: "pointer", lineHeight: 1 }}>×</button>
+      </div>
+      {children}
+    </div>
+  </div>
+);
+
+// Simple SVG sparkline
+const Sparkline = ({ data, color = "#4fc97e", height = 50, width = 200 }) => {
+  if (!data || data.length < 2) return <div style={{ height, width, display: "flex", alignItems: "center", justifyContent: "center", color: "#555", fontSize: 12 }}>No data</div>;
+  const min = Math.min(...data), max = Math.max(...data);
+  const range = max - min || 1;
+  const pts = data.map((v, i) => `${(i / (data.length - 1)) * width},${height - ((v - min) / range) * (height - 6) - 3}`).join(" ");
+  return (
+    <svg width={width} height={height} style={{ overflow: "visible" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      {data.map((v, i) => (
+        <circle key={i} cx={(i / (data.length - 1)) * width} cy={height - ((v - min) / range) * (height - 6) - 3} r={3} fill={color} />
+      ))}
+    </svg>
+  );
+};
+
+const WaterGauge = ({ param, value }) => {
+  const pct = Math.min(100, Math.max(0, ((value - param.warn[0]) / (param.warn[1] - param.warn[0])) * 100));
+  const inRange = value >= param.min && value <= param.max;
+  const inWarn = value >= param.warn[0] && value <= param.warn[1];
+  const color = inRange ? "#4fc97e" : inWarn ? "#f5a623" : "#e8003d";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+        <span style={{ color: "#aaa" }}>{param.label}</span>
+        <span style={{ color, fontWeight: 700 }}>{value}{param.unit}</span>
+      </div>
+      <div style={{ height: 6, background: "rgba(255,255,255,0.08)", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3, transition: "width .4s" }} />
+      </div>
+      <div style={{ fontSize: 11, color: "#555" }}>Safe: {param.min}–{param.max}{param.unit}</div>
+    </div>
+  );
+};
+
+// ─── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [ponds, setPonds] = useState(() => load("ff_ponds", SEED.ponds));
+  const [waterLogs, setWaterLogs] = useState(() => load("ff_water", SEED.waterLogs));
+  const [activities, setActivities] = useState(() => load("ff_activities", SEED.activities));
+  const [feedStock, setFeedStock] = useState(() => load("ff_feedstock", SEED.feedStock));
+  const [feedLogs, setFeedLogs] = useState(() => load("ff_feedlogs", SEED.feedLogs));
+  const [growthLogs, setGrowthLogs] = useState(() => load("ff_growth", SEED.growthLogs));
+  const [healthLogs, setHealthLogs] = useState(() => load("ff_health", SEED.healthLogs));
+  const [financials, setFinancials] = useState(() => load("ff_financials", SEED.financials));
+  const [tab, setTab] = useState("dashboard");
+  const [selectedPond, setSelectedPond] = useState(null);
+  const [modal, setModal] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  useEffect(() => { save("ff_ponds", ponds); }, [ponds]);
+  useEffect(() => { save("ff_water", waterLogs); }, [waterLogs]);
+  useEffect(() => { save("ff_activities", activities); }, [activities]);
+  useEffect(() => { save("ff_feedstock", feedStock); }, [feedStock]);
+  useEffect(() => { save("ff_feedlogs", feedLogs); }, [feedLogs]);
+  useEffect(() => { save("ff_growth", growthLogs); }, [growthLogs]);
+  useEffect(() => { save("ff_health", healthLogs); }, [healthLogs]);
+  useEffect(() => { save("ff_financials", financials); }, [financials]);
+
+  const showToast = (msg, type = "success") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  // ── Derived stats ──
+  const activePonds = ponds.filter(p => p.status === "Active");
+  const totalFish = activePonds.reduce((s, p) => s + p.stocked, 0);
+  const totalFeed = feedStock.reduce((s, f) => s + f.qty, 0);
+  const latestWater = waterLogs.reduce((acc, w) => { if (!acc[w.pondId] || w.date > acc[w.pondId].date) acc[w.pondId] = w; return acc; }, {});
+  const alertPonds = activePonds.filter(p => {
+    const w = latestWater[p.id];
+    if (!w) return false;
+    return WATER_PARAMS.some(par => { const v = w[par.key]; return v !== undefined && (v < par.warn[0] || v > par.warn[1]); });
+  });
+
+  const getWaterStatus = (pondId) => {
+    const w = latestWater[pondId];
+    if (!w) return "gray";
+    const bad = WATER_PARAMS.some(par => { const v = w[par.key]; return v !== undefined && (v < par.warn[0] || v > par.warn[1]); });
+    const warn = WATER_PARAMS.some(par => { const v = w[par.key]; return v !== undefined && (v < par.min || v > par.max); });
+    return bad ? "red" : warn ? "yellow" : "green";
+  };
+
+  // ── Tabs ──
+  const TABS = [
+    { id: "dashboard", label: "🏠 Dashboard" },
+    { id: "ponds", label: "🏊 Ponds" },
+    { id: "stages", label: "📅 Stages" },
+    { id: "activities", label: "📝 Activities" },
+    { id: "water", label: "💧 Water" },
+    { id: "feed", label: "🍽️ Feed" },
+    { id: "analytics", label: "📊 Analytics" },
+    { id: "health", label: "🩺 Health" },
+    { id: "reports", label: "📋 Reports" },
+  ];
+
+  // ── DASHBOARD ──────────────────────────────────────────────────────────────
+  const Dashboard = () => {
+    const todayTasks = [];
+    activePonds.forEach(p => {
+      (STAGE_TASKS[p.stage] || []).forEach((t, i) => todayTasks.push({ pond: p.name, task: t, id: p.id + i }));
+    });
+    const overdue = activities.filter(a => a.status === "Delayed" || a.status === "Missed");
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 14 }}>
+          <StatCard icon="🏊" label="Active Ponds" value={activePonds.length} sub={`${ponds.length} total`} color="#4fc97e" />
+          <StatCard icon="🐟" label="Total Fish" value={totalFish.toLocaleString()} sub="stocked" color="#38b2f5" />
+          <StatCard icon="🍽️" label="Feed Stock" value={`${totalFeed} kg`} sub={totalFeed < 30 ? "⚠️ Low stock" : "OK"} color={totalFeed < 30 ? "#f5a623" : "#4fc97e"} />
+          <StatCard icon="⚠️" label="Water Alerts" value={alertPonds.length} sub={alertPonds.map(p => p.name).join(", ") || "All clear"} color={alertPonds.length > 0 ? "#e8003d" : "#4fc97e"} />
+          <StatCard icon="⏰" label="Overdue Tasks" value={overdue.length} sub="activities" color={overdue.length > 0 ? "#f5a623" : "#4fc97e"} />
+          <StatCard icon="🌱" label="Harvest Soon" value={ponds.filter(p => p.stage === "Harvest-ready").length} sub="ponds ready" color="#c97e4f" />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+          <Card>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15, color: "#4fc97e", fontFamily: "'Syne', sans-serif" }}>📋 Today's Tasks</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+              {todayTasks.length === 0 ? <p style={{ color: "#555", fontSize: 13 }}>No active ponds</p> :
+                todayTasks.map(t => (
+                  <div key={t.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 10px", background: "rgba(79,201,126,0.06)", borderRadius: 8, borderLeft: "3px solid #4fc97e" }}>
+                    <span style={{ fontSize: 11, color: "#4fc97e", fontWeight: 700, whiteSpace: "nowrap" }}>{t.pond}</span>
+                    <span style={{ fontSize: 13, color: "#ccc" }}>{t.task}</span>
+                  </div>
+                ))}
+            </div>
+          </Card>
+
+          <Card>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15, color: "#4fc97e", fontFamily: "'Syne', sans-serif" }}>🏊 Pond Status</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {ponds.map(p => {
+                const ws = getWaterStatus(p.id);
+                const wsColor = ws === "green" ? "#4fc97e" : ws === "yellow" ? "#f5a623" : ws === "red" ? "#e8003d" : "#555";
+                const utilPct = p.capacity > 0 ? Math.round((p.stocked / p.capacity) * 100) : 0;
+                return (
+                  <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                    <div style={{ width: 10, height: 10, borderRadius: "50%", background: wsColor, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: "#ddd" }}>{p.name}</div>
+                      <div style={{ fontSize: 11, color: "#666" }}>{p.species} · {p.stage}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 12, color: "#aaa" }}>{utilPct}% capacity</div>
+                      <Badge color={p.status === "Active" ? "green" : p.status === "Fallow" ? "gray" : "blue"}>{p.status}</Badge>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        </div>
+
+        {alertPonds.length > 0 && (
+          <Card style={{ borderColor: "rgba(232,0,61,0.4)", background: "rgba(232,0,61,0.06)" }}>
+            <h3 style={{ margin: "0 0 12px", color: "#e8003d", fontSize: 15, fontFamily: "'Syne', sans-serif" }}>🚨 Critical Alerts</h3>
+            {alertPonds.map(p => {
+              const w = latestWater[p.id];
+              const badParams = WATER_PARAMS.filter(par => { const v = w[par.key]; return v !== undefined && (v < par.warn[0] || v > par.warn[1]); });
+              return (
+                <div key={p.id} style={{ marginBottom: 8, padding: "10px 14px", background: "rgba(232,0,61,0.08)", borderRadius: 8 }}>
+                  <strong style={{ color: "#e8003d" }}>{p.name}</strong>
+                  <span style={{ color: "#ccc", fontSize: 13 }}> — {badParams.map(par => `${par.label}: ${w[par.key]}${par.unit}`).join(", ")}</span>
+                </div>
+              );
+            })}
+          </Card>
+        )}
+      </div>
+    );
+  };
+
+  // ── PONDS ──────────────────────────────────────────────────────────────────
+  const [pondForm, setPondForm] = useState({ name: "", species: "Tilapia", capacity: "", stocked: "", stage: "Fingerling", status: "Active" });
+
+  const Ponds = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Pond Management</h2>
+        <Btn onClick={() => setModal("addPond")}>+ Add Pond</Btn>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
+        {ponds.map(p => {
+          const utilPct = p.capacity > 0 ? Math.round((p.stocked / p.capacity) * 100) : 0;
+          const ws = getWaterStatus(p.id);
+          const wsColor = ws === "green" ? "#4fc97e" : ws === "yellow" ? "#f5a623" : ws === "red" ? "#e8003d" : "#555";
+          const pActs = activities.filter(a => a.pondId === p.id).slice(-3);
+          return (
+            <Card key={p.id} style={{ cursor: "pointer", transition: "transform .15s", ":hover": { transform: "translateY(-2px)" } }}
+              onClick={() => { setSelectedPond(p.id); setTab("activities"); }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "#fff", fontFamily: "'Syne', sans-serif" }}>{p.name}</div>
+                  <div style={{ fontSize: 13, color: "#888" }}>{p.species}</div>
+                </div>
+                <Badge color={p.status === "Active" ? "green" : p.status === "Fallow" ? "gray" : p.status === "Harvested" ? "blue" : "yellow"}>{p.status}</Badge>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                <div style={{ textAlign: "center", padding: "10px", background: "rgba(255,255,255,0.04)", borderRadius: 8 }}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: "#4fc97e" }}>{p.stocked.toLocaleString()}</div>
+                  <div style={{ fontSize: 11, color: "#777" }}>Fish Stocked</div>
+                </div>
+                <div style={{ textAlign: "center", padding: "10px", background: "rgba(255,255,255,0.04)", borderRadius: 8 }}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: "#38b2f5" }}>{p.weight}g</div>
+                  <div style={{ fontSize: 11, color: "#777" }}>Avg Weight</div>
+                </div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 12, color: "#888" }}>
+                  <span>Capacity ({utilPct}%)</span><span>{p.stocked}/{p.capacity}</span>
+                </div>
+                <div style={{ height: 6, background: "rgba(255,255,255,0.07)", borderRadius: 3 }}>
+                  <div style={{ width: `${utilPct}%`, height: "100%", background: utilPct > 90 ? "#e8003d" : "#4fc97e", borderRadius: 3 }} />
+                </div>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: wsColor }} />
+                  <span style={{ fontSize: 12, color: "#888" }}>Water: {ws === "gray" ? "No data" : ws}</span>
+                </div>
+                <span style={{ fontSize: 12, color: "#666", fontStyle: "italic" }}>{p.stage}</span>
+              </div>
+              <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                <Btn variant="ghost" style={{ fontSize: 12, padding: "6px 12px" }} onClick={e => { e.stopPropagation(); setModal("editPond"); setPondForm({ ...p }); }}>Edit</Btn>
+                <Btn variant="danger" style={{ fontSize: 12, padding: "6px 12px" }} onClick={e => { e.stopPropagation(); if (confirm("Delete pond?")) { setPonds(ps => ps.filter(x => x.id !== p.id)); showToast("Pond deleted"); } }}>Delete</Btn>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+      {(modal === "addPond" || modal === "editPond") && (
+        <Modal title={modal === "addPond" ? "Add New Pond" : "Edit Pond"} onClose={() => setModal(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <Input label="Pond Name" value={pondForm.name} onChange={v => setPondForm(f => ({ ...f, name: v }))} />
+            <Input label="Species" value={pondForm.species} onChange={v => setPondForm(f => ({ ...f, species: v }))} />
+            <Input label="Capacity" type="number" value={pondForm.capacity} onChange={v => setPondForm(f => ({ ...f, capacity: +v }))} />
+            <Input label="Fish Stocked" type="number" value={pondForm.stocked} onChange={v => setPondForm(f => ({ ...f, stocked: +v }))} />
+            <Input label="Avg Weight (g)" type="number" value={pondForm.weight || ""} onChange={v => setPondForm(f => ({ ...f, weight: +v }))} />
+            <Select label="Stage" value={pondForm.stage} onChange={v => setPondForm(f => ({ ...f, stage: v }))} options={STAGE_ORDER} />
+            <Select label="Status" value={pondForm.status} onChange={v => setPondForm(f => ({ ...f, status: v }))} options={["Active", "Fallow", "Harvested", "Under Treatment"]} />
+            <Btn onClick={() => {
+              if (!pondForm.name) return;
+              if (modal === "addPond") {
+                setPonds(ps => [...ps, { ...pondForm, id: uid(), stagedAt: today(), created: today() }]);
+              } else {
+                setPonds(ps => ps.map(p => p.id === pondForm.id ? pondForm : p));
+              }
+              setModal(null); setPondForm({ name: "", species: "Tilapia", capacity: "", stocked: "", stage: "Fingerling", status: "Active" });
+              showToast(modal === "addPond" ? "Pond added!" : "Pond updated!");
+            }}>Save Pond</Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+
+  // ── STAGES ──────────────────────────────────────────────────────────────────
+  const Stages = () => {
+    const advanceStage = (pond) => {
+      const idx = STAGE_ORDER.indexOf(pond.stage);
+      if (idx < STAGE_ORDER.length - 1) {
+        setPonds(ps => ps.map(p => p.id === pond.id ? { ...p, stage: STAGE_ORDER[idx + 1], stagedAt: today() } : p));
+        showToast(`${pond.name} advanced to ${STAGE_ORDER[idx + 1]}`);
+      }
+    };
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Farm Stage Management</h2>
+        {activePonds.map(p => {
+          const stageIdx = STAGE_ORDER.indexOf(p.stage);
+          const daysInStage = daysBetween(p.stagedAt, today());
+          const maxDays = STAGE_DAYS[p.stage] || 1;
+          const stagePct = Math.min(100, Math.round((daysInStage / maxDays) * 100));
+          const daysLeft = Math.max(0, maxDays - daysInStage);
+          return (
+            <Card key={p.id}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
+                <div>
+                  <h3 style={{ margin: "0 0 4px", fontFamily: "'Syne', sans-serif", color: "#fff" }}>{p.name}</h3>
+                  <span style={{ color: "#888", fontSize: 13 }}>{p.species} · {p.stocked.toLocaleString()} fish</span>
+                </div>
+                {stageIdx < STAGE_ORDER.length - 1 && <Btn onClick={() => advanceStage(p)} variant="blue">Advance Stage →</Btn>}
+              </div>
+              <div style={{ display: "flex", gap: 0, marginBottom: 18 }}>
+                {STAGE_ORDER.map((s, i) => {
+                  const active = i === stageIdx;
+                  const done = i < stageIdx;
+                  return (
+                    <div key={s} style={{ flex: 1, textAlign: "center" }}>
+                      <div style={{ display: "flex", alignItems: "center" }}>
+                        <div style={{ flex: 1, height: 2, background: done ? "#4fc97e" : "rgba(255,255,255,0.1)" }} />
+                        <div style={{ width: 24, height: 24, borderRadius: "50%", background: active ? "#4fc97e" : done ? "#1a7a4a" : "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, color: active ? "#0a1a12" : done ? "#4fc97e" : "#555", flexShrink: 0 }}>
+                          {done ? "✓" : i + 1}
+                        </div>
+                        <div style={{ flex: 1, height: 2, background: done || active ? "#4fc97e" : "rgba(255,255,255,0.1)" }} />
+                      </div>
+                      <div style={{ fontSize: 11, color: active ? "#4fc97e" : done ? "#666" : "#444", marginTop: 6, fontWeight: active ? 700 : 400 }}>{s}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 18 }}>
+                <div style={{ padding: 12, background: "rgba(255,255,255,0.04)", borderRadius: 8, textAlign: "center" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: "#4fc97e" }}>{daysInStage}d</div>
+                  <div style={{ fontSize: 11, color: "#777" }}>In current stage</div>
+                </div>
+                <div style={{ padding: 12, background: "rgba(255,255,255,0.04)", borderRadius: 8, textAlign: "center" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: "#f5a623" }}>{daysLeft}d</div>
+                  <div style={{ fontSize: 11, color: "#777" }}>Until next stage</div>
+                </div>
+                <div style={{ padding: 12, background: "rgba(255,255,255,0.04)", borderRadius: 8, textAlign: "center" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: "#38b2f5" }}>{stagePct}%</div>
+                  <div style={{ fontSize: 11, color: "#777" }}>Stage progress</div>
+                </div>
+              </div>
+              <div style={{ height: 6, background: "rgba(255,255,255,0.07)", borderRadius: 3, marginBottom: 18 }}>
+                <div style={{ width: `${stagePct}%`, height: "100%", background: "#4fc97e", borderRadius: 3, transition: "width .4s" }} />
+              </div>
+              <h4 style={{ margin: "0 0 10px", fontSize: 13, color: "#888", textTransform: "uppercase", letterSpacing: 0.5 }}>Stage Tasks for {p.stage}</h4>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {(STAGE_TASKS[p.stage] || []).map((t, i) => (
+                  <div key={i} style={{ padding: "8px 12px", background: "rgba(79,201,126,0.05)", borderRadius: 7, fontSize: 13, color: "#ccc", borderLeft: "2px solid #4fc97e" }}>✦ {t}</div>
+                ))}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ── ACTIVITIES ──────────────────────────────────────────────────────────────
+  const [actForm, setActForm] = useState({ pondId: ponds[0]?.id || "", type: "Feeding", date: today(), qty: "", note: "", status: "Done" });
+
+  const Activities = () => {
+    const filtered = selectedPond ? activities.filter(a => a.pondId === selectedPond) : activities;
+    const sorted = [...filtered].sort((a, b) => b.date.localeCompare(a.date));
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Activity Logger</h2>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Select label="" value={selectedPond || ""} onChange={v => setSelectedPond(v || null)} options={[{ value: "", label: "All Ponds" }, ...ponds.map(p => ({ value: p.id, label: p.name }))]} />
+            <Btn onClick={() => setModal("addActivity")}>+ Log Activity</Btn>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {sorted.length === 0 ? <Card><p style={{ color: "#555", textAlign: "center" }}>No activities logged yet</p></Card> :
+            sorted.map(a => {
+              const pond = ponds.find(p => p.id === a.pondId);
+              const statusColor = a.status === "Done" ? "#4fc97e" : a.status === "Delayed" ? "#f5a623" : "#e8003d";
+              return (
+                <Card key={a.id} style={{ display: "flex", alignItems: "center", gap: 16, padding: "14px 18px" }}>
+                  <div style={{ width: 40, height: 40, borderRadius: 10, background: "rgba(79,201,126,0.12)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>
+                    {{ Feeding: "🍽️", "Water Change": "💧", Medication: "💊", Harvesting: "🎣", Stocking: "🐟" }[a.type] || "📝"}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <span style={{ fontWeight: 700, color: "#ddd", fontSize: 14 }}>{a.type}</span>
+                      {pond && <span style={{ fontSize: 12, color: "#4fc97e", background: "rgba(79,201,126,0.12)", padding: "2px 8px", borderRadius: 10 }}>{pond.name}</span>}
+                    </div>
+                    <div style={{ fontSize: 12, color: "#666", marginTop: 3 }}>{fmt(a.date)} {a.qty && `· ${a.qty}`} {a.note && `· ${a.note}`}</div>
+                  </div>
+                  <Badge color={a.status === "Done" ? "green" : a.status === "Delayed" ? "yellow" : "red"}>{a.status}</Badge>
+                  <button onClick={() => setActivities(acts => acts.filter(x => x.id !== a.id))} style={{ background: "none", border: "none", color: "#444", cursor: "pointer", fontSize: 16 }}>×</button>
+                </Card>
+              );
+            })}
+        </div>
+        {modal === "addActivity" && (
+          <Modal title="Log Activity" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={actForm.pondId} onChange={v => setActForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Select label="Activity Type" value={actForm.type} onChange={v => setActForm(f => ({ ...f, type: v }))} options={["Feeding", "Water Change", "Medication", "Harvesting", "Stocking", "Sampling", "Other"]} />
+              <Input label="Date" type="date" value={actForm.date} onChange={v => setActForm(f => ({ ...f, date: v }))} />
+              <Input label="Quantity / Amount" value={actForm.qty} onChange={v => setActForm(f => ({ ...f, qty: v }))} placeholder="e.g. 2.5 kg, 20%" />
+              <Input label="Notes" value={actForm.note} onChange={v => setActForm(f => ({ ...f, note: v }))} />
+              <Select label="Status" value={actForm.status} onChange={v => setActForm(f => ({ ...f, status: v }))} options={["Done", "Delayed", "Missed"]} />
+              <Btn onClick={() => {
+                setActivities(acts => [...acts, { ...actForm, id: uid() }]);
+                setModal(null); showToast("Activity logged!");
+              }}>Save Activity</Btn>
+            </div>
+          </Modal>
+        )}
+      </div>
+    );
+  };
+
+  // ── WATER ──────────────────────────────────────────────────────────────────
+  const [waterForm, setWaterForm] = useState({ pondId: ponds[0]?.id || "", date: today(), ph: "", temp: "", do: "", ammonia: "", turbidity: "" });
+
+  const Water = () => {
+    const pondLogs = (selectedPond ? waterLogs.filter(w => w.pondId === selectedPond) : waterLogs).sort((a, b) => b.date.localeCompare(a.date));
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Water Quality Monitor</h2>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Select label="" value={selectedPond || ""} onChange={v => setSelectedPond(v || null)} options={[{ value: "", label: "All Ponds" }, ...ponds.map(p => ({ value: p.id, label: p.name }))]} />
+            <Btn onClick={() => setModal("addWater")}>+ Log Water</Btn>
+          </div>
+        </div>
+        {/* Latest readings per active pond */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
+          {activePonds.filter(p => !selectedPond || p.id === selectedPond).map(p => {
+            const w = latestWater[p.id];
+            return (
+              <Card key={p.id}>
+                <h3 style={{ margin: "0 0 16px", color: "#fff", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>{p.name}</h3>
+                {!w ? <p style={{ color: "#555", fontSize: 13 }}>No readings yet</p> : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div style={{ fontSize: 11, color: "#555", marginBottom: -4 }}>Last updated: {fmt(w.date)}</div>
+                    {WATER_PARAMS.map(par => w[par.key] !== undefined && <WaterGauge key={par.key} param={par} value={w[par.key]} />)}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+        {/* Historical trend sparklines */}
+        {WATER_PARAMS.map(par => {
+          const pId = selectedPond || activePonds[0]?.id;
+          const data = waterLogs.filter(w => w.pondId === pId && w[par.key] !== undefined).sort((a, b) => a.date.localeCompare(b.date)).map(w => w[par.key]);
+          if (data.length < 2) return null;
+          return (
+            <Card key={par.key} style={{ display: "flex", gap: 20, alignItems: "center" }}>
+              <div style={{ minWidth: 120 }}>
+                <div style={{ fontWeight: 700, color: "#ddd", fontSize: 14 }}>{par.label}</div>
+                <div style={{ color: "#888", fontSize: 12 }}>Trend</div>
+              </div>
+              <Sparkline data={data} width={240} height={50} />
+              <div style={{ textAlign: "right", minWidth: 80 }}>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#38b2f5" }}>{data[data.length - 1]}{par.unit}</div>
+                <div style={{ fontSize: 11, color: "#666" }}>Latest</div>
+              </div>
+            </Card>
+          );
+        })}
+        <Card>
+          <h3 style={{ margin: "0 0 14px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📜 Reading History</h3>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ color: "#666", textAlign: "left" }}>
+                  <th style={{ padding: "8px 10px" }}>Pond</th><th style={{ padding: "8px 10px" }}>Date</th>
+                  {WATER_PARAMS.map(p => <th key={p.key} style={{ padding: "8px 10px" }}>{p.label}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {pondLogs.slice(0, 20).map(w => {
+                  const pond = ponds.find(p => p.id === w.pondId);
+                  return (
+                    <tr key={w.id} style={{ borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+                      <td style={{ padding: "8px 10px", color: "#4fc97e" }}>{pond?.name}</td>
+                      <td style={{ padding: "8px 10px", color: "#888" }}>{fmt(w.date)}</td>
+                      {WATER_PARAMS.map(par => {
+                        const v = w[par.key]; const inR = v >= par.min && v <= par.max; const inW = v >= par.warn[0] && v <= par.warn[1];
+                        const c = v === undefined ? "#555" : inR ? "#4fc97e" : inW ? "#f5a623" : "#e8003d";
+                        return <td key={par.key} style={{ padding: "8px 10px", color: c, fontWeight: 600 }}>{v ?? "—"}</td>;
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+        {modal === "addWater" && (
+          <Modal title="Log Water Quality" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={waterForm.pondId} onChange={v => setWaterForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Input label="Date" type="date" value={waterForm.date} onChange={v => setWaterForm(f => ({ ...f, date: v }))} />
+              {WATER_PARAMS.map(par => <Input key={par.key} label={`${par.label} (${par.unit || "–"})`} type="number" step="0.1" value={waterForm[par.key]} onChange={v => setWaterForm(f => ({ ...f, [par.key]: +v }))} placeholder={`${par.min}–${par.max}`} />)}
+              <Btn onClick={() => {
+                setWaterLogs(ls => [...ls, { ...waterForm, id: uid() }]);
+                setModal(null); showToast("Water reading saved!");
+              }}>Save Reading</Btn>
+            </div>
+          </Modal>
+        )}
+      </div>
+    );
+  };
+
+  // ── FEED ──────────────────────────────────────────────────────────────────
+  const [feedForm, setFeedForm] = useState({ item: "", qty: "", unit: "kg" });
+  const [feedLogForm, setFeedLogForm] = useState({ pondId: ponds[0]?.id || "", date: today(), feedItem: "", qty: "", note: "" });
+
+  const Feed = () => {
+    const totalStock = feedStock.reduce((s, f) => s + f.qty, 0);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Feed Management</h2>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+          <Card>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📦 Inventory</h3>
+              <Btn variant="ghost" style={{ fontSize: 12, padding: "6px 12px" }} onClick={() => setModal("addFeedStock")}>+ Add Stock</Btn>
+            </div>
+            {totalStock < 30 && <div style={{ marginBottom: 12, padding: "8px 12px", background: "rgba(245,166,35,0.12)", borderRadius: 8, color: "#f5a623", fontSize: 13 }}>⚠️ Low feed stock — {totalStock}kg remaining</div>}
+            {feedStock.map(f => (
+              <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                <div>
+                  <div style={{ fontWeight: 700, color: "#ddd", fontSize: 14 }}>{f.item}</div>
+                </div>
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <span style={{ fontSize: 18, fontWeight: 800, color: f.qty < 20 ? "#e8003d" : "#4fc97e" }}>{f.qty} {f.unit}</span>
+                  <button onClick={() => setFeedStock(fs => fs.filter(x => x.id !== f.id))} style={{ background: "none", border: "none", color: "#444", cursor: "pointer" }}>×</button>
+                </div>
+              </div>
+            ))}
+          </Card>
+
+          <Card>
+            <h3 style={{ margin: "0 0 16px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>🧮 Daily Feed Calculator</h3>
+            {activePonds.map(p => {
+              const biomass = (p.stocked * p.weight) / 1000;
+              const pct = p.stage === "Fingerling" ? 2 : p.stage === "Juvenile" ? 3 : p.stage === "Grow-out" ? 5 : 2;
+              const feedKg = ((biomass * pct) / 100).toFixed(2);
+              return (
+                <div key={p.id} style={{ padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <div style={{ fontWeight: 700, color: "#ddd", fontSize: 14 }}>{p.name}</div>
+                      <div style={{ fontSize: 12, color: "#666" }}>{biomass.toFixed(1)} kg biomass · {pct}% BW</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: "#4fc97e" }}>{feedKg} kg</div>
+                      <div style={{ fontSize: 11, color: "#777" }}>per day</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </Card>
+        </div>
+
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <h3 style={{ margin: 0, color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📋 Feed Log</h3>
+            <Btn onClick={() => setModal("logFeed")}>+ Log Feeding</Btn>
+          </div>
+          {feedLogs.length === 0 ? <p style={{ color: "#555", fontSize: 13 }}>No feed logs yet</p> :
+            feedLogs.slice().reverse().slice(0, 10).map(f => {
+              const pond = ponds.find(p => p.id === f.pondId);
+              return (
+                <div key={f.id} style={{ display: "flex", gap: 12, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)", alignItems: "center" }}>
+                  <span style={{ fontSize: 18 }}>🍽️</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, color: "#ddd", fontWeight: 600 }}>{pond?.name} — {f.feedItem}</div>
+                    <div style={{ fontSize: 11, color: "#666" }}>{fmt(f.date)} · {f.qty} kg {f.note && `· ${f.note}`}</div>
+                  </div>
+                </div>
+              );
+            })}
+        </Card>
+
+        {modal === "addFeedStock" && (
+          <Modal title="Add Feed Stock" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Input label="Feed Item Name" value={feedForm.item} onChange={v => setFeedForm(f => ({ ...f, item: v }))} placeholder="e.g. Grower Pellets 4mm" />
+              <Input label="Quantity" type="number" value={feedForm.qty} onChange={v => setFeedForm(f => ({ ...f, qty: +v }))} />
+              <Select label="Unit" value={feedForm.unit} onChange={v => setFeedForm(f => ({ ...f, unit: v }))} options={["kg", "bags", "tons"]} />
+              <Btn onClick={() => { setFeedStock(fs => [...fs, { ...feedForm, id: uid() }]); setModal(null); setFeedForm({ item: "", qty: "", unit: "kg" }); showToast("Stock added!"); }}>Save</Btn>
+            </div>
+          </Modal>
+        )}
+        {modal === "logFeed" && (
+          <Modal title="Log Feeding" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={feedLogForm.pondId} onChange={v => setFeedLogForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Input label="Date" type="date" value={feedLogForm.date} onChange={v => setFeedLogForm(f => ({ ...f, date: v }))} />
+              <Select label="Feed Item" value={feedLogForm.feedItem} onChange={v => setFeedLogForm(f => ({ ...f, feedItem: v }))} options={[{ value: "", label: "Select…" }, ...feedStock.map(f => ({ value: f.item, label: f.item }))]} />
+              <Input label="Quantity (kg)" type="number" step="0.1" value={feedLogForm.qty} onChange={v => setFeedLogForm(f => ({ ...f, qty: +v }))} />
+              <Input label="Notes" value={feedLogForm.note} onChange={v => setFeedLogForm(f => ({ ...f, note: v }))} />
+              <Btn onClick={() => {
+                setFeedLogs(fl => [...fl, { ...feedLogForm, id: uid() }]);
+                setFeedStock(fs => fs.map(f => f.item === feedLogForm.feedItem ? { ...f, qty: Math.max(0, f.qty - feedLogForm.qty) } : f));
+                setModal(null); showToast("Feeding logged!");
+              }}>Save</Btn>
+            </div>
+          </Modal>
+        )}
+      </div>
+    );
+  };
+
+  // ── ANALYTICS ──────────────────────────────────────────────────────────────
+  const Analytics = () => {
+    const [finForm, setFinForm] = useState({ pondId: ponds[0]?.id || "", type: "Expense", category: "Feed", amount: "", date: today(), note: "" });
+    const [growForm, setGrowForm] = useState({ pondId: ponds[0]?.id || "", date: today(), weight: "" });
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Performance & Analytics</h2>
+        {/* Growth tracking */}
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <h3 style={{ margin: 0, color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📈 Growth Tracking</h3>
+            <Btn variant="ghost" style={{ fontSize: 12, padding: "6px 12px" }} onClick={() => setModal("logGrowth")}>+ Log Weight</Btn>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 16 }}>
+            {activePonds.map(p => {
+              const pGrowth = growthLogs.filter(g => g.pondId === p.id).sort((a, b) => a.date.localeCompare(b.date));
+              const data = pGrowth.map(g => g.weight);
+              const gain = data.length > 1 ? (data[data.length - 1] - data[0]).toFixed(0) : 0;
+              return (
+                <Card key={p.id} style={{ background: "rgba(255,255,255,0.02)", padding: "16px" }}>
+                  <div style={{ fontWeight: 700, color: "#ddd", marginBottom: 12 }}>{p.name}</div>
+                  <Sparkline data={data} width={220} height={60} color="#38b2f5" />
+                  <div style={{ display: "flex", gap: 16, marginTop: 10 }}>
+                    <div><div style={{ fontSize: 16, fontWeight: 800, color: "#4fc97e" }}>{p.weight}g</div><div style={{ fontSize: 11, color: "#777" }}>Current</div></div>
+                    <div><div style={{ fontSize: 16, fontWeight: 800, color: "#38b2f5" }}>+{gain}g</div><div style={{ fontSize: 11, color: "#777" }}>Total gain</div></div>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        </Card>
+        {/* Financials */}
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <h3 style={{ margin: 0, color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>💰 Cost & Revenue</h3>
+            <Btn variant="ghost" style={{ fontSize: 12, padding: "6px 12px" }} onClick={() => setModal("logFinancial")}>+ Add Entry</Btn>
+          </div>
+          {ponds.map(p => {
+            const pFin = financials.filter(f => f.pondId === p.id);
+            const expenses = pFin.filter(f => f.type === "Expense").reduce((s, f) => s + f.amount, 0);
+            const revenue = pFin.filter(f => f.type === "Revenue").reduce((s, f) => s + f.amount, 0);
+            const profit = revenue - expenses;
+            return (
+              <div key={p.id} style={{ padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontWeight: 700, color: "#ddd" }}>{p.name}</span>
+                  <div style={{ display: "flex", gap: 20 }}>
+                    <div style={{ textAlign: "right" }}><div style={{ color: "#e8003d", fontWeight: 700 }}>₦{expenses.toLocaleString()}</div><div style={{ fontSize: 11, color: "#666" }}>Expenses</div></div>
+                    <div style={{ textAlign: "right" }}><div style={{ color: "#4fc97e", fontWeight: 700 }}>₦{revenue.toLocaleString()}</div><div style={{ fontSize: 11, color: "#666" }}>Revenue</div></div>
+                    <div style={{ textAlign: "right" }}><div style={{ color: profit >= 0 ? "#4fc97e" : "#e8003d", fontWeight: 800, fontSize: 18 }}>₦{profit.toLocaleString()}</div><div style={{ fontSize: 11, color: "#666" }}>P&L</div></div>
+                  </div>
+                </div>
+                {profit < 0 && <div style={{ marginTop: 6, padding: "6px 10px", background: "rgba(232,0,61,0.1)", borderRadius: 6, fontSize: 12, color: "#e8003d" }}>🚨 In the red — costs exceed projections</div>}
+              </div>
+            );
+          })}
+        </Card>
+        {/* Survival rate */}
+        <Card>
+          <h3 style={{ margin: "0 0 16px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📉 Pond Comparison</h3>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ color: "#666" }}>
+                  {["Pond", "Species", "Stage", "Fish", "Avg Wt", "Biomass", "Utilization"].map(h => <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {ponds.map(p => {
+                  const biomass = ((p.stocked * p.weight) / 1000).toFixed(1);
+                  const util = p.capacity > 0 ? Math.round((p.stocked / p.capacity) * 100) : 0;
+                  return (
+                    <tr key={p.id} style={{ borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+                      <td style={{ padding: "10px 12px", fontWeight: 700, color: "#ddd" }}>{p.name}</td>
+                      <td style={{ padding: "10px 12px", color: "#aaa" }}>{p.species}</td>
+                      <td style={{ padding: "10px 12px", color: "#888" }}>{p.stage}</td>
+                      <td style={{ padding: "10px 12px", color: "#4fc97e", fontWeight: 700 }}>{p.stocked.toLocaleString()}</td>
+                      <td style={{ padding: "10px 12px", color: "#38b2f5" }}>{p.weight}g</td>
+                      <td style={{ padding: "10px 12px", color: "#c97e4f" }}>{biomass} kg</td>
+                      <td style={{ padding: "10px 12px" }}><div style={{ display: "flex", alignItems: "center", gap: 8 }}><div style={{ flex: 1, height: 6, background: "rgba(255,255,255,0.07)", borderRadius: 3 }}><div style={{ width: `${util}%`, height: "100%", background: util > 90 ? "#e8003d" : "#4fc97e", borderRadius: 3 }} /></div><span style={{ color: "#aaa", fontSize: 12 }}>{util}%</span></div></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+        {modal === "logGrowth" && (
+          <Modal title="Log Growth Sample" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={growForm.pondId} onChange={v => setGrowForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Input label="Date" type="date" value={growForm.date} onChange={v => setGrowForm(f => ({ ...f, date: v }))} />
+              <Input label="Avg Weight (g)" type="number" value={growForm.weight} onChange={v => setGrowForm(f => ({ ...f, weight: +v }))} />
+              <Btn onClick={() => {
+                setGrowthLogs(gl => [...gl, { ...growForm, id: uid() }]);
+                setPonds(ps => ps.map(p => p.id === growForm.pondId ? { ...p, weight: +growForm.weight } : p));
+                setModal(null); showToast("Growth logged!");
+              }}>Save</Btn>
+            </div>
+          </Modal>
+        )}
+        {modal === "logFinancial" && (
+          <Modal title="Add Financial Entry" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={finForm.pondId} onChange={v => setFinForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Select label="Type" value={finForm.type} onChange={v => setFinForm(f => ({ ...f, type: v }))} options={["Expense", "Revenue"]} />
+              <Select label="Category" value={finForm.category} onChange={v => setFinForm(f => ({ ...f, category: v }))} options={["Feed", "Labour", "Medication", "Equipment", "Sale", "Other"]} />
+              <Input label="Amount (₦)" type="number" value={finForm.amount} onChange={v => setFinForm(f => ({ ...f, amount: +v }))} />
+              <Input label="Date" type="date" value={finForm.date} onChange={v => setFinForm(f => ({ ...f, date: v }))} />
+              <Input label="Note" value={finForm.note} onChange={v => setFinForm(f => ({ ...f, note: v }))} />
+              <Btn onClick={() => {
+                setFinancials(fin => [...fin, { ...finForm, id: uid() }]);
+                setModal(null); showToast("Entry saved!");
+              }}>Save</Btn>
+            </div>
+          </Modal>
+        )}
+      </div>
+    );
+  };
+
+  // ── HEALTH ──────────────────────────────────────────────────────────────────
+  const [healthForm, setHealthForm] = useState({ pondId: ponds[0]?.id || "", date: today(), disease: "", symptoms: "", treatment: "", dosage: "", note: "" });
+
+  const Health = () => {
+    const [pondVol, setPondVol] = useState(50);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Health & Disease Tracker</h2>
+          <Btn onClick={() => setModal("logHealth")}>+ Log Health Event</Btn>
+        </div>
+        {/* Disease reference */}
+        <Card>
+          <h3 style={{ margin: "0 0 16px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📖 Disease Reference Guide</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
+            {DISEASES.map(d => (
+              <div key={d.name} style={{ padding: 14, background: "rgba(255,255,255,0.03)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.07)" }}>
+                <div style={{ fontWeight: 800, color: "#e8a020", marginBottom: 6, fontSize: 14 }}>{d.name}</div>
+                <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}><strong style={{ color: "#aaa" }}>Symptoms:</strong> {d.symptoms}</div>
+                <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}><strong style={{ color: "#aaa" }}>Remedy:</strong> {d.remedy}</div>
+                <div style={{ fontSize: 12, color: "#4fc97e" }}>💊 {d.dosage}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+        {/* Dosage calculator */}
+        <Card>
+          <h3 style={{ margin: "0 0 14px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>🧪 Medication Dosage Calculator</h3>
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <Input label="Pond Volume (m³)" type="number" value={pondVol} onChange={setPondVol} />
+            {DISEASES.map(d => {
+              const mgL = parseFloat(d.dosage);
+              if (isNaN(mgL)) return null;
+              const totalMg = (mgL * pondVol * 1000).toFixed(0);
+              return (
+                <div key={d.name} style={{ padding: "10px 14px", background: "rgba(255,255,255,0.03)", borderRadius: 8, minWidth: 160 }}>
+                  <div style={{ fontSize: 12, color: "#888" }}>{d.name}</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "#38b2f5" }}>{(totalMg / 1000).toFixed(2)} g</div>
+                  <div style={{ fontSize: 11, color: "#666" }}>for {pondVol}m³</div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+        {/* Health log */}
+        <Card>
+          <h3 style={{ margin: "0 0 14px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📋 Treatment History</h3>
+          {healthLogs.length === 0 ? <p style={{ color: "#555", fontSize: 13 }}>No health events logged</p> :
+            healthLogs.slice().reverse().map(h => {
+              const pond = ponds.find(p => p.id === h.pondId);
+              return (
+                <div key={h.id} style={{ padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                    <span style={{ fontSize: 20 }}>🩺</span>
+                    <div>
+                      <div style={{ fontWeight: 700, color: "#ddd" }}>{h.disease || "Health Event"} — <span style={{ color: "#4fc97e" }}>{pond?.name}</span></div>
+                      <div style={{ fontSize: 12, color: "#888" }}>{fmt(h.date)}</div>
+                      {h.symptoms && <div style={{ fontSize: 12, color: "#aaa", marginTop: 4 }}>Symptoms: {h.symptoms}</div>}
+                      {h.treatment && <div style={{ fontSize: 12, color: "#38b2f5", marginTop: 2 }}>Treatment: {h.treatment} {h.dosage && `(${h.dosage})`}</div>}
+                      {h.note && <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>{h.note}</div>}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+        </Card>
+        {modal === "logHealth" && (
+          <Modal title="Log Health Event" onClose={() => setModal(null)}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Select label="Pond" value={healthForm.pondId} onChange={v => setHealthForm(f => ({ ...f, pondId: v }))} options={ponds.map(p => ({ value: p.id, label: p.name }))} />
+              <Input label="Date" type="date" value={healthForm.date} onChange={v => setHealthForm(f => ({ ...f, date: v }))} />
+              <Select label="Disease/Issue" value={healthForm.disease} onChange={v => setHealthForm(f => ({ ...f, disease: v }))} options={[{ value: "", label: "Custom / Other" }, ...DISEASES.map(d => ({ value: d.name, label: d.name }))]} />
+              <Input label="Symptoms Observed" value={healthForm.symptoms} onChange={v => setHealthForm(f => ({ ...f, symptoms: v }))} />
+              <Input label="Treatment Applied" value={healthForm.treatment} onChange={v => setHealthForm(f => ({ ...f, treatment: v }))} />
+              <Input label="Dosage" value={healthForm.dosage} onChange={v => setHealthForm(f => ({ ...f, dosage: v }))} />
+              <Input label="Notes" value={healthForm.note} onChange={v => setHealthForm(f => ({ ...f, note: v }))} />
+              <Btn onClick={() => {
+                setHealthLogs(hl => [...hl, { ...healthForm, id: uid() }]);
+                setModal(null); showToast("Health event logged!");
+              }}>Save</Btn>
+            </div>
+          </Modal>
+        )}
+      </div>
+    );
+  };
+
+  // ── REPORTS ──────────────────────────────────────────────────────────────────
+  const Reports = () => {
+    const exportCSV = () => {
+      const rows = [["Pond", "Date", "Activity", "Qty", "Note", "Status"]];
+      activities.forEach(a => {
+        const p = ponds.find(x => x.id === a.pondId);
+        rows.push([p?.name, a.date, a.type, a.qty, a.note, a.status]);
+      });
+      const csv = rows.map(r => r.join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url; a.download = "farm_activities.csv"; a.click();
+    };
+    const totalExp = financials.filter(f => f.type === "Expense").reduce((s, f) => s + f.amount, 0);
+    const totalRev = financials.filter(f => f.type === "Revenue").reduce((s, f) => s + f.amount, 0);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h2 style={{ margin: 0, fontFamily: "'Syne', sans-serif", color: "#4fc97e" }}>Reports & Export</h2>
+          <Btn onClick={exportCSV} variant="blue">⬇ Export Activities CSV</Btn>
+        </div>
+        {/* Summary cards */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 14 }}>
+          <StatCard icon="📝" label="Total Activities" value={activities.length} color="#38b2f5" />
+          <StatCard icon="💧" label="Water Readings" value={waterLogs.length} color="#4fc97e" />
+          <StatCard icon="🩺" label="Health Events" value={healthLogs.length} color="#e8a020" />
+          <StatCard icon="💰" label="Total Expenses" value={`₦${totalExp.toLocaleString()}`} color="#e8003d" />
+          <StatCard icon="📈" label="Total Revenue" value={`₦${totalRev.toLocaleString()}`} color="#4fc97e" />
+          <StatCard icon="🏦" label="Net P&L" value={`₦${(totalRev - totalExp).toLocaleString()}`} color={totalRev - totalExp >= 0 ? "#4fc97e" : "#e8003d"} />
+        </div>
+        {/* Weekly summary */}
+        <Card>
+          <h3 style={{ margin: "0 0 16px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>📅 Weekly Farm Summary</h3>
+          {ponds.map(p => {
+            const pActs = activities.filter(a => a.pondId === p.id && a.date >= new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10));
+            const w = latestWater[p.id];
+            return (
+              <div key={p.id} style={{ marginBottom: 20, padding: 16, background: "rgba(255,255,255,0.03)", borderRadius: 10 }}>
+                <div style={{ fontWeight: 800, color: "#fff", fontFamily: "'Syne', sans-serif", marginBottom: 10 }}>{p.name}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10 }}>
+                  <div style={{ textAlign: "center" }}><div style={{ fontSize: 20, fontWeight: 800, color: "#4fc97e" }}>{pActs.length}</div><div style={{ fontSize: 11, color: "#777" }}>Activities (7d)</div></div>
+                  <div style={{ textAlign: "center" }}><div style={{ fontSize: 20, fontWeight: 800, color: "#38b2f5" }}>{p.stocked}</div><div style={{ fontSize: 11, color: "#777" }}>Fish Count</div></div>
+                  <div style={{ textAlign: "center" }}><div style={{ fontSize: 20, fontWeight: 800, color: w ? (getWaterStatus(p.id) === "green" ? "#4fc97e" : "#f5a623") : "#555" }}>{w ? "✓" : "?"}</div><div style={{ fontSize: 11, color: "#777" }}>Water Status</div></div>
+                </div>
+              </div>
+            );
+          })}
+        </Card>
+        {/* Expense breakdown */}
+        <Card>
+          <h3 style={{ margin: "0 0 14px", color: "#4fc97e", fontFamily: "'Syne', sans-serif", fontSize: 15 }}>💸 Expense Breakdown</h3>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead><tr style={{ color: "#666" }}>
+                {["Date", "Pond", "Type", "Category", "Amount", "Note"].map(h => <th key={h} style={{ padding: "8px 10px", textAlign: "left" }}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {financials.slice().sort((a, b) => b.date.localeCompare(a.date)).map(f => {
+                  const p = ponds.find(x => x.id === f.pondId);
+                  return (
+                    <tr key={f.id} style={{ borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+                      <td style={{ padding: "8px 10px", color: "#888" }}>{fmt(f.date)}</td>
+                      <td style={{ padding: "8px 10px", color: "#4fc97e" }}>{p?.name}</td>
+                      <td style={{ padding: "8px 10px" }}><Badge color={f.type === "Revenue" ? "green" : "red"}>{f.type}</Badge></td>
+                      <td style={{ padding: "8px 10px", color: "#aaa" }}>{f.category}</td>
+                      <td style={{ padding: "8px 10px", fontWeight: 700, color: f.type === "Revenue" ? "#4fc97e" : "#e8003d" }}>₦{f.amount.toLocaleString()}</td>
+                      <td style={{ padding: "8px 10px", color: "#666" }}>{f.note}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+    );
+  };
+
+  // ── RENDER ──────────────────────────────────────────────────────────────────
+  const VIEWS = { dashboard: Dashboard, ponds: Ponds, stages: Stages, activities: Activities, water: Water, feed: Feed, analytics: Analytics, health: Health, reports: Reports };
+  const View = VIEWS[tab] || Dashboard;
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;600&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #060e0a; color: #ccc; font-family: 'IBM Plex Mono', monospace; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #1a4029; border-radius: 2px; }
+        input:focus, select:focus { border-color: #4fc97e !important; box-shadow: 0 0 0 2px rgba(79,201,126,0.15); }
+      `}</style>
+      <div style={{ minHeight: "100vh", background: "radial-gradient(ellipse 80% 60% at 50% 0%, #0a2018 0%, #060e0a 70%)" }}>
+        {/* Header */}
+        <div style={{ borderBottom: "1px solid rgba(255,255,255,0.07)", padding: "0 24px", display: "flex", alignItems: "center", gap: 20, height: 58, position: "sticky", top: 0, background: "rgba(6,14,10,0.92)", backdropFilter: "blur(12px)", zIndex: 100 }}>
+          <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: "#4fc97e", letterSpacing: -0.5, display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            <span style={{ fontSize: 22 }}>🐟</span> AquaFarm
+          </div>
+          <div style={{ flex: 1, display: "flex", gap: 2, overflowX: "auto" }}>
+            {TABS.map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)}
+                style={{ padding: "6px 12px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12, fontFamily: "'Syne', sans-serif", fontWeight: 600, whiteSpace: "nowrap", background: tab === t.id ? "rgba(79,201,126,0.15)" : "transparent", color: tab === t.id ? "#4fc97e" : "#666", transition: "all .15s" }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ flexShrink: 0, display: "flex", gap: 8, alignItems: "center" }}>
+            {alertPonds.length > 0 && <div style={{ background: "#e8003d", color: "#fff", borderRadius: 20, padding: "3px 10px", fontSize: 11, fontWeight: 700 }}>🚨 {alertPonds.length} ALERT{alertPonds.length > 1 ? "S" : ""}</div>}
+            <div style={{ fontSize: 12, color: "#555" }}>{fmt(today())}</div>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 24px 60px" }}>
+          <View />
+        </div>
+
+        {/* Toast */}
+        {toast && (
+          <div style={{ position: "fixed", bottom: 28, right: 28, background: toast.type === "success" ? "#1a7a4a" : "#a0001e", color: "#fff", padding: "12px 20px", borderRadius: 10, fontSize: 14, fontWeight: 600, boxShadow: "0 8px 32px rgba(0,0,0,0.4)", zIndex: 2000, animation: "fadeIn .2s" }}>
+            {toast.msg}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
